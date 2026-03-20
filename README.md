@@ -20,10 +20,10 @@ Or download the latest APK from the [Releases](https://github.com/Dreaming-Codes
 
 ```sh
 # Set Immich Cloud Photos as the cloud media provider
-adb shell cmd media_session set-cloud-provider codes.dreaming.cloudmedia/codes.dreaming.cloudmedia.provider.ImmichCloudMediaProvider
+adb shell device_config override mediaprovider allowed_cloud_providers codes.dreaming.cloudmedia
 
 # For the debug build
-adb shell cmd media_session set-cloud-provider codes.dreaming.cloudmedia.debug/codes.dreaming.cloudmedia.provider.ImmichCloudMediaProvider
+adb shell device_config override mediaprovider allowed_cloud_providers codes.dreaming.cloudmedia.debug
 ```
 
 3. Open any app's photo picker — your Immich library will appear as a cloud source.
