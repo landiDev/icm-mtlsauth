@@ -56,6 +56,15 @@ object ImmichRepository {
   private var peopleCacheTime: Long = 0
   private const val PEOPLE_CACHE_TTL_MS = 5 * 60 * 1000L
 
+  // Track asset IDs returned by main sync vs album queries.
+  // Album assets not in the main sync need to be appended so the picker
+  // stores them in its main cloud_media table (required for sharing).
+  private val mainSyncAssetIds = mutableSetOf<String>()
+  private val pendingAlbumAssets = mutableListOf<ImmichAsset>()
+  @Volatile
+  var hasPendingAlbumAssets = false
+    private set
+
   fun initialize(context: Context) {
     appContext = context.applicationContext
     syncPrefs = appContext.getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
@@ -66,7 +75,7 @@ object ImmichRepository {
   val isConfigured: Boolean get() = ApiClient.isLoggedIn
 
   fun getMediaCollectionId(): String =
-    syncPrefs.getString("media_collection_id", "immich-cloud-v1") ?: "immich-cloud-v1"
+    syncPrefs.getString("media_collection_id", "immich-cloud-v4") ?: "immich-cloud-v4"
 
   fun getLastSyncGeneration(): Long {
     if (syncGeneration == 0L) refreshSyncGeneration()
@@ -152,8 +161,6 @@ object ImmichRepository {
     val ids = mutableSetOf<String>()
     var page = 1
     while (true) {
-      val url = ApiClient.buildUrl("/timeline/buckets") ?: break
-      // Use search/metadata to page through all assets for IDs only
       val searchUrl = ApiClient.buildUrl("/search/metadata") ?: break
       val body = JSONObject().apply {
         put("page", page)
@@ -214,6 +221,7 @@ object ImmichRepository {
         put("page", page)
         put("size", pageSize)
         put("order", "desc")
+        put("withExif", true)
       }
       val request = Request.Builder()
         .url(url)
@@ -236,9 +244,25 @@ object ImmichRepository {
       for (i in 0 until items.length()) {
         assets.add(assetFromApiJson(items.getJSONObject(i)))
       }
+      assets.forEach { mainSyncAssetIds.add(it.id) }
 
       val fetched = (page - 1) * pageSize + assets.size
-      val nextToken = if (fetched < total) (page + 1).toString() else null
+      var nextToken = if (fetched < total) (page + 1).toString() else null
+
+      // When the main sync is complete, fetch all album assets and
+      // include any that weren't in the /search/metadata results
+      // (e.g. shared album items from other users).
+      if (nextToken == null) {
+        val albumAssets = fetchAllAlbumOnlyAssets()
+        if (albumAssets.isNotEmpty()) {
+          Log.d(TAG, "queryAllAssets: appending ${albumAssets.size} album-only assets to main sync")
+          assets.addAll(albumAssets)
+          albumAssets.forEach { mainSyncAssetIds.add(it.id) }
+        }
+        pendingAlbumAssets.clear()
+        hasPendingAlbumAssets = false
+      }
+
       Log.d(TAG, "queryAllAssets: returning ${assets.size} assets, nextToken=$nextToken")
       QueryResult(assets, nextToken)
     } catch (e: Exception) {
@@ -272,6 +296,22 @@ object ImmichRepository {
       val assets = mutableListOf<ImmichAsset>()
       for (i in offset until end) {
         assets.add(assetFromApiJson(assetsArr.getJSONObject(i)))
+      }
+
+      // Track album assets that aren't yet in the main sync so they
+      // can be appended when the picker next queries main media.
+      var foundNew = false
+      for (asset in assets) {
+        if (asset.id !in mainSyncAssetIds) {
+          pendingAlbumAssets.removeAll { it.id == asset.id }
+          pendingAlbumAssets.add(asset)
+          foundNew = true
+        }
+      }
+      if (foundNew) {
+        hasPendingAlbumAssets = true
+        incrementSyncGeneration()
+        Log.d(TAG, "queryAlbumAssets: found ${pendingAlbumAssets.size} assets not in main sync, incremented syncGen to $syncGeneration")
       }
 
       val nextToken = if (end < assetsArr.length()) end.toString() else null
@@ -363,6 +403,7 @@ object ImmichRepository {
         put("personIds", JSONArray().put(personId))
         put("page", page)
         put("size", pageSize)
+        put("withExif", true)
       }
       val request = Request.Builder()
         .url(url)
@@ -404,6 +445,7 @@ object ImmichRepository {
         put("query", query)
         put("page", page)
         put("size", pageSize)
+        put("withExif", true)
       }
       val request = Request.Builder()
         .url(url)
@@ -443,6 +485,47 @@ object ImmichRepository {
     return downloadToTempFile(Request.Builder().url(url).get().build(), "media_$assetId")
   }
 
+  fun openMediaStreaming(assetId: String): ParcelFileDescriptor? {
+    Log.d(TAG, "openMediaStreaming: assetId=$assetId")
+    if (assetId.startsWith("person:")) {
+      val personId = assetId.removePrefix("person:")
+      val url = ApiClient.buildUrl("/people/$personId/thumbnail") ?: return null
+      return downloadToTempFile(Request.Builder().url(url).get().build(), "person_$personId")
+    }
+    val url = ApiClient.buildUrl("/assets/$assetId/original") ?: return null
+    val request = Request.Builder().url(url).get().build()
+    return try {
+      val pipe = ParcelFileDescriptor.createPipe()
+      val readFd = pipe[0]
+      val writeFd = pipe[1]
+      Thread {
+        try {
+          val response = ApiClient.getClient().newCall(request).execute()
+          if (!response.isSuccessful) {
+            Log.e(TAG, "openMediaStreaming: HTTP ${response.code} for $assetId")
+            response.close()
+            writeFd.close()
+            return@Thread
+          }
+          ParcelFileDescriptor.AutoCloseOutputStream(writeFd).use { output ->
+            response.body?.byteStream()?.use { input ->
+              input.copyTo(output, 65536)
+            }
+          }
+          response.close()
+          Log.d(TAG, "openMediaStreaming: completed streaming $assetId")
+        } catch (e: Exception) {
+          Log.e(TAG, "openMediaStreaming: error streaming $assetId", e)
+          try { writeFd.close() } catch (_: Exception) {}
+        }
+      }.start()
+      readFd
+    } catch (e: Exception) {
+      Log.e(TAG, "openMediaStreaming: pipe creation failed for $assetId", e)
+      null
+    }
+  }
+
   fun openPreview(assetId: String, size: Point): ParcelFileDescriptor? {
     if (assetId.startsWith("person:")) {
       val personId = assetId.removePrefix("person:")
@@ -480,6 +563,7 @@ object ImmichRepository {
     val type = a.optString("type", "IMAGE")
     val isImage = type == "IMAGE"
     val createdAt = a.optString("fileCreatedAt", a.optString("createdAt", ""))
+    val originalMimeType = a.optString("originalMimeType", "")
     val exifInfo = a.optJSONObject("exifInfo")
     val fileSize = exifInfo?.optLong("fileSizeInByte", 1) ?: 1L
     val orientation = exifInfo?.optString("orientation", "0")?.toIntOrNull() ?: 0
@@ -487,9 +571,16 @@ object ImmichRepository {
     val height = exifInfo?.optInt("exifImageHeight", 0) ?: 0
     val duration = a.optString("duration", "")
     val durationMillis = parseDuration(duration)
+
+    val mimeType = when {
+      originalMimeType.isNotBlank() && originalMimeType != "null" -> originalMimeType
+      isImage -> "image/jpeg"
+      else -> "video/mp4"
+    }
+
     return ImmichAsset(
       id = id,
-      mimeType = if (isImage) "image/jpeg" else "video/mp4",
+      mimeType = mimeType,
       dateTakenMillis = parseIso8601(createdAt),
       width = width, height = height,
       sizeBytes = if (fileSize > 0) fileSize else 1L,
@@ -498,6 +589,35 @@ object ImmichRepository {
       orientation = orientation,
       isImage = isImage
     )
+  }
+
+  private fun fetchAllAlbumOnlyAssets(): List<ImmichAsset> {
+    return try {
+      val albums = queryAlbums()
+      val albumOnlyAssets = mutableListOf<ImmichAsset>()
+      for (album in albums) {
+        val url = ApiClient.buildUrl("/albums/${album.id}") ?: continue
+        val request = Request.Builder().url(url).get().build()
+        val response = ApiClient.getClient().newCall(request).execute()
+        if (!response.isSuccessful) { response.close(); continue }
+        val body = response.body?.string() ?: "{}"
+        response.close()
+        val obj = JSONObject(body)
+        val assetsArr = obj.optJSONArray("assets") ?: continue
+        for (i in 0 until assetsArr.length()) {
+          val asset = assetFromApiJson(assetsArr.getJSONObject(i))
+          if (asset.id !in mainSyncAssetIds) {
+            albumOnlyAssets.add(asset)
+            mainSyncAssetIds.add(asset.id)
+          }
+        }
+      }
+      Log.d(TAG, "fetchAllAlbumOnlyAssets: found ${albumOnlyAssets.size} assets across ${albums.size} albums")
+      albumOnlyAssets
+    } catch (e: Exception) {
+      Log.e(TAG, "fetchAllAlbumOnlyAssets error", e)
+      emptyList()
+    }
   }
 
   private fun parseDuration(duration: String): Long {

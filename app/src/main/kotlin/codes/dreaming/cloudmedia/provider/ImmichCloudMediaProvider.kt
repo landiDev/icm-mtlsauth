@@ -8,6 +8,7 @@ import android.graphics.Point
 import android.os.Bundle
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
+import android.net.Uri
 import android.provider.CloudMediaProvider
 import android.provider.CloudMediaProviderContract
 import android.util.Log
@@ -88,6 +89,18 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
 
     if (result.nextPageToken == null && albumId == null) {
       ImmichRepository.snapshotCurrentAssetIds()
+    }
+
+    // If the album query discovered assets not in the main sync,
+    // notify the picker so it triggers a re-sync of main media.
+    if (albumId != null && ImmichRepository.hasPendingAlbumAssets) {
+      val ctx = context
+      if (ctx != null) {
+        val providerAuthority = "${ctx.packageName}.cloudmedia"
+        val mediaUri = Uri.parse("content://$providerAuthority/media")
+        ctx.contentResolver.notifyChange(mediaUri, null)
+        Log.d(TAG, "onQueryMedia: notified picker of pending album assets for re-sync")
+      }
     }
 
     val cursorExtras = Bundle()
@@ -257,6 +270,7 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     cancellationSignal: CancellationSignal?
   ): ParcelFileDescriptor {
     checkPermission()
+    Log.d(TAG, "onOpenMedia: mediaId=$mediaId")
     return ImmichRepository.openMedia(mediaId)
       ?: throw FileNotFoundException("Failed to open media: $mediaId")
   }
@@ -269,6 +283,7 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     cancellationSignal: CancellationSignal?
   ): AssetFileDescriptor {
     checkPermission()
+    Log.d(TAG, "onOpenPreview: mediaId=$mediaId size=${size.x}x${size.y}")
     val fd = ImmichRepository.openPreview(mediaId, size)
       ?: throw FileNotFoundException("Failed to open preview: $mediaId")
     return AssetFileDescriptor(fd, 0, AssetFileDescriptor.UNKNOWN_LENGTH)
