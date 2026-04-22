@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.security.KeyChain
 import android.util.Log
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 import okhttp3.Cache
 import okhttp3.ConnectionPool
 import okhttp3.Cookie
@@ -51,7 +53,7 @@ object ApiClient {
       if (initialized) return
 
       appContext = context.applicationContext
-      prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      buildEncryptedPrefs(appContext)
 
       buildClient(appContext)
       initialized = true
@@ -215,6 +217,21 @@ object ApiClient {
     } catch (e: Exception) {
       Log.e(TAG, "fetchAndSaveAccountName error", e)
     }
+  }
+
+  @Suppress("DEPRECATION")
+  fun buildEncryptedPrefs(context: Context) {
+    val masterKey = MasterKey.Builder(context)
+      .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+      .build()
+
+    prefs = EncryptedSharedPreferences.create(
+      context,
+      PREFS_NAME,
+      masterKey,
+      EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+      EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+    )
   }
 
   fun buildKeyManager(alias: String, context: Context): X509KeyManager? {
